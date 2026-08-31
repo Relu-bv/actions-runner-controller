@@ -1,0 +1,129 @@
+# Publish the patched ARC image to Relu's develop ECR.
+#
+# FORK-ONLY. This workflow does not exist upstream; it is additive so rebases
+# onto actions/actions-runner-controller stay clean.
+#
+# One image carries both `manager` and `ghalistener`, and the controller passes
+# its own reference to the listener pods via CONTROLLER_MANAGER_CONTAINER_IMAGE.
+# So this single artifact is everything the cluster needs.
+#
+# The IAM role is created by modules/github-runners/ecr_arc_image.tf in
+# versioned-vpengine-infrastructure, and trusts ONLY this repository via GitHub
+# OIDC — there are no long-lived AWS keys for this pipeline.
+name: Publish Relu ARC image
+
+on:
+  push:
+    tags:
+      # Our own tag namespace, deliberately distinct from upstream's
+      # `gha-runner-scale-set-x.y.z` tags so a rebase or an upstream tag fetch
+      # can never trigger a publish.
+      - "relu-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (e.g. relu-v0.14.2-localcapacity.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required to request the OIDC token for the AWS role
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: arc/gha-runner-scale-set-controller
+
+jobs:
+  publish:
+    name: Build and push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # The ECR repository is IMMUTABLE and Terraform pins an exact tag, so
+          # a moving tag would be rejected on push anyway. Fail early with a
+          # clear message rather than after a full multi-arch build.
+          if [ "$tag" = "latest" ]; then
+            echo "::error::Refusing to publish 'latest': the ECR repository is immutable and Terraform pins an exact tag."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Publishing tag: $tag"
+
+      # Guard rail: the whole point of the fork is the local-capacity gate. If a
+      # rebase ever drops it, the build must fail loudly rather than quietly
+      # shipping a stock ARC image under a Relu tag that Terraform believes is
+      # patched.
+      - name: Verify the patch is present
+        run: |
+          set -euo pipefail
+          test -d cmd/ghalistener/localcapacity \
+            || { echo "::error::cmd/ghalistener/localcapacity is missing — the fork's patch was lost."; exit 1; }
+          grep -q "localcapacity" cmd/ghalistener/main.go \
+            || { echo "::error::main.go no longer wires up the local capacity poller."; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./cmd/ghalistener/...
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ARC_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # amd64 only: the CI Karpenter pool pins amd64 (see the ci-runners
+          # NodePool), so an arm64 layer would be dead weight in every pull.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+            COMMIT_SHA=${{ github.sha }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}"
+            echo '```'
+            echo
+            echo "Set \`arc_image_tag = \"${{ steps.meta.outputs.tag }}\"\` in"
+            echo "\`environments/develop/32_github_runners/main.tf\` to roll it out."
+          } >> "$GITHUB_STEP_SUMMARY"
