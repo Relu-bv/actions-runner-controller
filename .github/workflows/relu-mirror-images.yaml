@@ -1,0 +1,184 @@
+# Mirror the third-party runner images Relu's EKS clusters run into first-party
+# ECR repositories.
+#
+# FORK-ONLY. Additive, so rebases onto actions/actions-runner-controller stay
+# clean.
+#
+# WHY MIRROR RATHER THAN PULL-THROUGH-CACHE:
+#
+# An ECR pull-through cache for ghcr.io requires a stored credential secret —
+# AWS demands one even when the upstream images are public, which these are. A
+# cache earns that cost when you pull many or unpredictable images. We pull
+# exactly three, each pinned to an exact version. Copying them here instead
+# means the cluster needs no registry credential at all: this workflow already
+# has a GitHub token for ghcr, and AWS access comes from OIDC.
+#
+# The result is that every image in every runner pod spec is a first-party ECR
+# repository, and the only credential the whole system needs is the GitHub App
+# that ARC authenticates with.
+#
+# The destination repositories and the IAM role are created by
+# modules/github-runners/ecr_images.tf in versioned-vpengine-infrastructure.
+# Terraform is the source of truth for the pinned tags — read them from its
+# `mirror_sources` output, mirror, then bump the tag in Terraform.
+name: Mirror runner images to ECR
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_tag:
+        description: "actions-runner tag to mirror (e.g. 2.336.0)"
+        required: false
+        type: string
+      arc_tag:
+        description: "upstream gha-runner-scale-set-controller tag (e.g. 0.14.2)"
+        required: false
+        type: string
+      cache_server_tag:
+        description: "github-actions-cache-server tag (e.g. 9.7.0)"
+        required: false
+        type: string
+      runner_upstream:
+        description: "Upstream runner image path"
+        required: false
+        default: falcondev-oss/actions-runner
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # to request the OIDC token for the AWS role
+  packages: read # to pull from ghcr (public images, but be explicit)
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  mirror:
+    name: Mirror ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Independent copies; one failure should not hide the others.
+      fail-fast: false
+      matrix:
+        include:
+          - name: runner
+            tag_input: runner_tag
+          - name: arc-controller
+            tag_input: arc_tag
+          - name: cache-server
+            tag_input: cache_server_tag
+
+    steps:
+      - name: Resolve source and destination
+        id: img
+        env:
+          RUNNER_TAG: ${{ inputs.runner_tag }}
+          ARC_TAG: ${{ inputs.arc_tag }}
+          CACHE_TAG: ${{ inputs.cache_server_tag }}
+          RUNNER_UPSTREAM: ${{ inputs.runner_upstream }}
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.name }}" in
+            runner)
+              tag="$RUNNER_TAG"
+              src="ghcr.io/${RUNNER_UPSTREAM}"
+              dst="mirror/actions-runner"
+              ;;
+            arc-controller)
+              tag="$ARC_TAG"
+              src="ghcr.io/actions/gha-runner-scale-set-controller"
+              dst="mirror/gha-runner-scale-set-controller"
+              ;;
+            cache-server)
+              tag="$CACHE_TAG"
+              src="ghcr.io/falcondev-oss/github-actions-cache-server"
+              dst="mirror/github-actions-cache-server"
+              ;;
+          esac
+
+          # An empty tag means "skip this one this run", so a single image can
+          # be re-mirrored without touching the others.
+          if [ -z "$tag" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No tag supplied for ${{ matrix.name }}; skipping."
+            exit 0
+          fi
+
+          # The destination repositories are IMMUTABLE, so a moving tag could
+          # never be re-pushed anyway. Fail early and clearly.
+          if [ "$tag" = "latest" ]; then
+            echo "::error::Refusing to mirror 'latest': destination repositories are immutable and Terraform pins exact tags."
+            exit 1
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "src=${src}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "dst_repo=${dst}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        if: steps.img.outputs.skip == 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ARC_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: steps.img.outputs.skip == 'false'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Skip if the tag is already mirrored
+        if: steps.img.outputs.skip == 'false'
+        id: exists
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+              --repository-name "${{ steps.img.outputs.dst_repo }}" \
+              --image-ids imageTag="${{ steps.img.outputs.tag }}" \
+              --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.img.outputs.dst_repo }}:${{ steps.img.outputs.tag }} already exists; nothing to do."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.img.outputs.skip == 'false' && steps.exists.outputs.already == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Copy image
+        if: steps.img.outputs.skip == 'false' && steps.exists.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          src="${{ steps.img.outputs.src }}"
+          dst="${{ steps.ecr.outputs.registry }}/${{ steps.img.outputs.dst_repo }}:${{ steps.img.outputs.tag }}"
+
+          echo "Mirroring $src -> $dst"
+
+          # imagetools copies the manifest (and every layer it references)
+          # registry-to-registry. Layers are never pulled onto this runner, so
+          # a multi-GB image costs no local disk and no extra time, and the
+          # digest is preserved rather than rebuilt.
+          docker buildx imagetools create --tag "$dst" "$src"
+
+          echo "Mirrored digest:"
+          docker buildx imagetools inspect "$dst" --format '{{ .Manifest.Digest }}'
+
+      - name: Summary
+        if: steps.img.outputs.skip == 'false'
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            if [ "${{ steps.exists.outputs.already }}" = "true" ]; then
+              echo "Already present — skipped."
+            else
+              echo '```'
+              echo "${{ steps.img.outputs.src }}"
+              echo "  -> ${{ steps.ecr.outputs.registry }}/${{ steps.img.outputs.dst_repo }}:${{ steps.img.outputs.tag }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
