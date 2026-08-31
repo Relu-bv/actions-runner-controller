@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/config"
+	"github.com/actions/actions-runner-controller/cmd/ghalistener/localcapacity"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/metrics"
 	"github.com/actions/actions-runner-controller/cmd/ghalistener/scaler"
 	"github.com/actions/actions-runner-controller/github/actions"
@@ -127,6 +128,45 @@ func run(ctx context.Context, config *config.Config) error {
 		return fmt.Errorf("failed to create new kubernetes worker: %w", err)
 	}
 
+	// Local capacity gating (opt-in, off by default). When enabled, the scale
+	// set advertises zero capacity while runners outside ARC — typically static
+	// on-premises machines — are online and idle, so the Actions service routes
+	// queued jobs to them instead. See the localcapacity package docs.
+	localCapacityConfig, err := localcapacity.FromEnv(
+		config.MaxRunners,
+		config.EphemeralRunnerSetName,
+		config.RunnerScaleSetName,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to read local capacity configuration: %w", err)
+	}
+
+	var localCapacityPoller *localcapacity.Poller
+	if localCapacityConfig.Enabled {
+		if config.MinRunners > 0 {
+			// Warm runners are already registered and idle, so the Actions
+			// service can hand them a job without consulting advertised
+			// capacity at all. The gate cannot hold them back.
+			logger.Warn(
+				"minRunners is greater than zero while local capacity gating is enabled; "+
+					"warm runners will still accept jobs the local pool could have taken",
+				"minRunners", config.MinRunners,
+			)
+		}
+
+		lister, err := localcapacity.NewLister(ghConfig, config.AppConfig, localCapacityConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create local capacity lister: %w", err)
+		}
+
+		localCapacityPoller = localcapacity.NewPoller(
+			lister,
+			listener,
+			localCapacityConfig,
+			logger.With("component", "local capacity"),
+		)
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 	metricsCtx, cancelMetrics := context.WithCancelCause(ctx)
 
@@ -136,6 +176,12 @@ func run(ctx context.Context, config *config.Config) error {
 		cancelMetrics(fmt.Errorf("listener exited: %w", listnerErr))
 		return listnerErr
 	})
+
+	if localCapacityPoller != nil {
+		g.Go(func() error {
+			return localCapacityPoller.Run(ctx)
+		})
+	}
 
 	if metricsExporter != nil {
 		g.Go(func() error {
