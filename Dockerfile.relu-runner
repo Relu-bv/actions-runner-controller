@@ -1,0 +1,102 @@
+# Relu's runner image: the mirrored upstream runner, plus the tools a job needs
+# on PATH before its first step can run.
+#
+# FORK-ONLY and additive, like the other relu-* files here — rebases onto
+# actions/actions-runner-controller stay clean.
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+#
+# The upstream runner image (actions/runner, images/Dockerfile) installs `git`
+# from ppa:git-core and nothing else. That is deliberate: GitHub's *hosted*
+# runners get their toolchain from actions/runner-images, a completely separate
+# artifact that we do not run. So every tool a workflow assumes is "just there"
+# on ubuntu-latest is absent here, and the failure lands before the job's own
+# logic starts — inside actions/checkout, or at test collection:
+#
+#   Error: Unable to locate executable file: git-lfs.
+#   pytest_postgresql.exceptions.ExecutableMissingException:
+#       Could not found pg_config executable. Is it in systenm $PATH?
+#
+# Installing these in a workflow step instead would put an apt fetch across the
+# NAT gateway on every single job, which is the cost modules/github-runners in
+# versioned-vpengine-infrastructure exists to remove. They belong in the image.
+#
+# ── WHY FROM THE MIRROR, NOT FROM ghcr ──────────────────────────────────────
+#
+# relu-mirror-images.yaml is the single point where a third-party image enters
+# our supply chain. Building on top of what has already been mirrored keeps ONE
+# upstream pin instead of two, and means this image cannot silently disagree
+# with the tag Terraform believes it is running.
+#
+# ── KEEP IT THIN ────────────────────────────────────────────────────────────
+#
+# Every megabyte here is pulled on every cold Karpenter node, on the critical
+# path of the first job to land there. Add a package because a workflow needs
+# it, not because it might. Anything a single job needs and the rest do not is
+# better installed by that job (setup-node, setup-uv and friends cache
+# themselves through the in-cluster Actions cache, so they do not cross the NAT
+# either).
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# The base ends on `USER runner`; apt needs root, and the runner must be
+# restored at the end or ARC's entrypoint runs as the wrong user.
+USER root
+
+# PostgreSQL binaries are NOT on the default PATH on Debian/Ubuntu — they live
+# in a versioned directory and are normally reached through postgresql-common's
+# wrappers. pytest-postgresql does not use those: it shells out to
+# `pg_config --bindir` and then execs pg_ctl/initdb from whatever that returns.
+#
+# Putting the versioned bindir first makes both halves consistent — `pg_config`
+# resolves to the one belonging to this server version, and its --bindir is the
+# directory it is itself in. Relying on libpq-dev's /usr/bin/pg_config instead
+# would answer for the client library, not for the server pytest-postgresql is
+# about to start.
+ENV PG_MAJOR=16
+ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+
+# Packages, and why each one is here:
+#
+#   git-lfs                     actions/checkout with `lfs: true`. relu-automate
+#                               LFS-tracks *.stl, *.dcm and the medical-viewer
+#                               fonts, so this is not optional there.
+#   postgresql-$PG_MAJOR        pytest-postgresql starts a REAL PostgreSQL, so it
+#                               needs the server binaries (initdb, pg_ctl), not
+#                               just libpq. 16 is what ubuntu-latest ships, so
+#                               tests meet the version they already passed on.
+#   postgresql-server-dev-$PG_MAJOR
+#                               ships /usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+#                               — the entry point pytest-postgresql discovers all
+#                               of the above through.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        git-lfs \
+        "postgresql-${PG_MAJOR}" \
+        "postgresql-server-dev-${PG_MAJOR}" \
+    && rm -rf /var/lib/apt/lists/*
+
+# Registers the LFS smudge/clean filters in /etc/gitconfig. Without it the
+# binaries are installed but `git lfs` is not wired into checkout for any user.
+# --skip-repo because there is no repository at build time.
+RUN git lfs install --system --skip-repo
+
+# The postgresql package creates and starts a default cluster on install.
+# Nothing runs it — pytest-postgresql calls initdb for its own throwaway data
+# directory — so it is dead weight in every layer pull, and a stale data dir
+# baked into an image is a trap besides.
+#
+# Its own RUN, and tolerant of a missing cluster: folding `|| true` onto the end
+# of an && chain would swallow a failure from every command before it too.
+RUN pg_dropcluster --stop "${PG_MAJOR}" main || true
+
+USER runner
+
+# Fail the BUILD rather than the CI job. Each of these has already cost a red
+# check once; a missing tool must not be discoverable only at runtime, on a
+# node, inside a job someone is waiting on.
+RUN git lfs version \
+    && pg_config --bindir \
+    && test -x "$(pg_config --bindir)/initdb" \
+    && test -x "$(pg_config --bindir)/pg_ctl"
