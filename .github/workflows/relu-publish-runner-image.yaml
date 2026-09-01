@@ -1,0 +1,132 @@
+# Build and publish Relu's runner image: the mirrored upstream runner plus the
+# tools a CI job needs on PATH before its first step can run.
+#
+# FORK-ONLY. Additive, so rebases onto actions/actions-runner-controller stay
+# clean. See Dockerfile.relu-runner for why the image exists at all.
+#
+# The destination repository (arc/actions-runner) and the IAM role are created
+# by modules/github-runners/ecr_images.tf in versioned-vpengine-infrastructure.
+# Terraform is the source of truth for the base image — read it from the
+# `runner_build_base_image` output rather than typing a tag here, so the build
+# cannot drift from the tag the cluster believes it is running.
+#
+# ORDER OF OPERATIONS: publish here first, THEN set runner_build_tag in
+# Terraform. Nothing on the Terraform side verifies the tag exists, so a tag
+# that was never built applies cleanly and leaves every runner pod in
+# ImagePullBackOff — which surfaces as jobs queueing with nothing in the runner
+# logs to explain it.
+name: Publish Relu runner image
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Base image to build FROM — the `runner_build_base_image` Terraform output (an ECR ref, not a ghcr one)"
+        required: true
+        type: string
+      tag:
+        description: "Tag to publish, as <upstream tag>-relu.<n> (e.g. 2.336.0-relu.1)"
+        required: true
+        type: string
+
+# Dispatch-only, and therefore always from the default branch. That is
+# deliberate: the image-push role's OIDC trust deliberately does NOT end in a
+# bare `:*`, and allows exactly `refs/tags/relu-v*` and `refs/heads/master`.
+# Adding a tag trigger here would need a matching change to
+# arc_fork_allowed_oidc_refs in Terraform first, or the assume-role fails with a
+# bare "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+permissions:
+  contents: read
+  id-token: write # to request the OIDC token for the AWS role
+
+env:
+  AWS_REGION: eu-central-1
+  DEST_REPO: arc/actions-runner
+
+jobs:
+  publish:
+    name: Build and push ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate inputs
+        env:
+          TAG: ${{ inputs.tag }}
+          BASE_IMAGE: ${{ inputs.base_image }}
+        run: |
+          set -euo pipefail
+
+          # The destination repository is IMMUTABLE, so a moving tag could never
+          # be re-pushed anyway. Fail early and clearly rather than at push.
+          if [ "$TAG" = "latest" ]; then
+            echo "::error::Refusing to publish 'latest': the repository is immutable and Terraform pins exact tags."
+            exit 1
+          fi
+
+          # Catches the most likely paste error — handing this the upstream ghcr
+          # reference instead of the mirrored one. Building from ghcr would work
+          # and would silently create a SECOND upstream pin that Terraform does
+          # not know about, which is exactly what mirroring exists to prevent.
+          case "$BASE_IMAGE" in
+            *.dkr.ecr.*.amazonaws.com/*) ;;
+            *)
+              echo "::error::base_image must be the ECR mirror (the runner_build_base_image output), not '$BASE_IMAGE'."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ARC_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Refuse to overwrite an existing tag
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+              --repository-name "$DEST_REPO" \
+              --image-ids imageTag="${{ inputs.tag }}" \
+              --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "::error::${DEST_REPO}:${{ inputs.tag }} already exists. Bump the -relu.<n> suffix; the repository is immutable."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # linux/amd64 only. The CI Karpenter NodePool requires
+      # kubernetes.io/arch=amd64, so an arm64 manifest would be built, pushed and
+      # never pulled — paying build time and registry storage for nothing. Add
+      # arm64 here at the same time as an arm64 pool, not before.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.relu-runner
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=${{ inputs.base_image }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.DEST_REPO }}:${{ inputs.tag }}
+          push: true
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ inputs.base_image }}"
+            echo "  -> ${{ steps.ecr.outputs.registry }}/${{ env.DEST_REPO }}:${{ inputs.tag }}"
+            echo '```'
+            echo
+            echo "Now set \`runner_build_tag = \"${{ inputs.tag }}\"\` in"
+            echo "\`environments/develop/32_github_runners/main.tf\` and apply."
+          } >> "$GITHUB_STEP_SUMMARY"
