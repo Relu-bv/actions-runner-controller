@@ -70,11 +70,38 @@ ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 #                               ships /usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 #                               — the entry point pytest-postgresql discovers all
 #                               of the above through.
+#
+#   libpango / libpangocairo / libgdk-pixbuf / libharfbuzz / libffi-dev
+#                               WeasyPrint's native stack. It dlopens these
+#                               through cffi at import time, so their absence is
+#                               an OSError during test COLLECTION, not a failed
+#                               assertion:
+#                                 cannot load library 'libpango-1.0-0'
+#
+#   libfontconfig1 + fonts-dejavu-core + fonts-liberation
+#                               NOT optional, and the reason is worth knowing:
+#                               with no font installed WeasyPrint still emits a
+#                               structurally VALID PDF, just with blank glyphs.
+#                               A renderer that silently produces empty output is
+#                               worse than one that fails, so the fonts ship with
+#                               the libraries. (Same note appears in
+#                               apps/backend/Dockerfile in relu-automate, which
+#                               is where this list is copied from.)
+#
+# The WeasyPrint list is deliberately IDENTICAL to the app image's, minus the
+# two entries that are app-runtime concerns rather than test ones: libjemalloc2
+# (LD_PRELOADed by the service, never by pytest) and curl/ca-certificates
+# (already in this base). Tests exercising a renderer should meet the same
+# native stack production does; drifting the two apart is how a PDF passes in CI
+# and renders differently in prod.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         git-lfs \
         "postgresql-${PG_MAJOR}" \
         "postgresql-server-dev-${PG_MAJOR}" \
+        libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
+        libharfbuzz0b libffi-dev \
+        libfontconfig1 fonts-dejavu-core fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Registers the LFS smudge/clean filters in /etc/gitconfig. Without it the
@@ -99,4 +126,9 @@ USER runner
 RUN git lfs version \
     && pg_config --bindir \
     && test -x "$(pg_config --bindir)/initdb" \
-    && test -x "$(pg_config --bindir)/pg_ctl"
+    && test -x "$(pg_config --bindir)/pg_ctl" \
+    && ldconfig -p | grep -q 'libpango-1\.0\.so\.0' \
+    && ldconfig -p | grep -q 'libpangocairo-1\.0\.so\.0' \
+    && ldconfig -p | grep -q 'libgdk_pixbuf-2\.0\.so\.0' \
+    && ldconfig -p | grep -q 'libharfbuzz\.so\.0' \
+    && ls /usr/share/fonts/truetype/dejavu/*.ttf >/dev/null
