@@ -49,11 +49,14 @@ USER root
 # wrappers. pytest-postgresql does not use those: it shells out to
 # `pg_config --bindir` and then execs pg_ctl/initdb from whatever that returns.
 #
-# Putting the versioned bindir first makes both halves consistent — `pg_config`
-# resolves to the one belonging to this server version, and its --bindir is the
-# directory it is itself in. Relying on libpq-dev's /usr/bin/pg_config instead
-# would answer for the client library, not for the server pytest-postgresql is
-# about to start.
+# Putting the versioned bindir first is what makes initdb and pg_ctl directly
+# reachable, and it is also the belt to pg_config's braces: whatever pg_config
+# reports, the binaries pytest-postgresql ultimately execs are on PATH anyway.
+#
+# Only ONE PostgreSQL major is installed here, so there is no ambiguity for
+# pg_config to get wrong — libpq-dev's /usr/bin/pg_config reports the bindir of
+# the version it was built against, which is this one. The assertion at the
+# bottom checks exactly that rather than trusting it.
 ENV PG_MAJOR=16
 ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 
@@ -66,10 +69,26 @@ ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 #                               needs the server binaries (initdb, pg_ctl), not
 #                               just libpq. 16 is what ubuntu-latest ships, so
 #                               tests meet the version they already passed on.
-#   postgresql-server-dev-$PG_MAJOR
-#                               ships /usr/lib/postgresql/$PG_MAJOR/bin/pg_config
-#                               — the entry point pytest-postgresql discovers all
-#                               of the above through.
+#   libpq-dev                   ships /usr/bin/pg_config, the entry point
+#                               pytest-postgresql discovers all of the above
+#                               through.
+#
+#                               NOT postgresql-server-dev-$PG_MAJOR, which also
+#                               ships a pg_config and was used here first. It
+#                               depends on clang-17 and llvm-17-dev — an entire
+#                               compiler toolchain, dragged into a CI runner
+#                               image for one binary. It was most of the
+#                               547 -> 851 MB growth, and that growth cost ~7s on
+#                               every cold node's pull, which ate more than half
+#                               of what removing init-dind-externals had just
+#                               won. libpq-dev has neither dependency.
+#
+#                               The build-time assertion at the bottom is what
+#                               makes this swap safe: pg_config must resolve AND
+#                               its --bindir must contain initdb and pg_ctl, so
+#                               if this pg_config answered for the client library
+#                               instead of the server, the build fails rather
+#                               than CI discovering it.
 #
 #   libpango / libpangocairo / libgdk-pixbuf / libharfbuzz / libffi-dev
 #                               WeasyPrint's native stack. It dlopens these
@@ -98,7 +117,7 @@ RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         git-lfs \
         "postgresql-${PG_MAJOR}" \
-        "postgresql-server-dev-${PG_MAJOR}" \
+        libpq-dev \
         libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
         libharfbuzz0b libffi-dev \
         libfontconfig1 fonts-dejavu-core fonts-liberation \
